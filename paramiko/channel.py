@@ -454,9 +454,11 @@ class Channel (ClosingContextManager):
         m.add_string(auth_cookie)
         m.add_int(screen_number)
         self._event_pending()
+        # the x11 slot is armed only through this CHANNEL_REQUEST (x11-req)
+        # path, never through the GLOBAL_REQUEST tcp-forward path
         self.transport._send_user_message(m)
         self._wait_for_event()
-        self.transport._set_x11_handler(handler)
+        self.transport._set_x11_handler(handler, via_channel_request=True)
         return auth_cookie
 
     @open_only
@@ -477,8 +479,12 @@ class Channel (ClosingContextManager):
         m.add_int(self.remote_chanid)
         m.add_string('auth-agent-req@openssh.com')
         m.add_boolean(False)
+        # the agent slot is armed only through this CHANNEL_REQUEST
+        # (auth-agent-req@openssh.com) path, never through the GLOBAL_REQUEST
+        # tcp-forward path
         self.transport._send_user_message(m)
-        self.transport._set_forward_agent_handler(handler)
+        self.transport._set_forward_agent_handler(handler,
+                                                  via_channel_request=True)
         return True
 
     def get_transport(self):

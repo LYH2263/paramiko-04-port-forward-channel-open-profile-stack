@@ -22,6 +22,7 @@ Core protocol implementation
 """
 
 from __future__ import print_function
+import contextlib
 import os
 import socket
 import sys
@@ -81,6 +82,282 @@ def _join_lingering_threads():
 
 import atexit
 atexit.register(_join_lingering_threads)
+
+
+# ---------------------------------------------------------------------------
+# Transport-scoped port-forward / channel-open profile stack
+# ---------------------------------------------------------------------------
+#
+# The reverse-forward control plane (GLOBAL_REQUEST tcpip-forward), the
+# outbound CHANNEL_OPEN payload plane, the inbound forwarded-channel delivery
+# plane, the three inbound handler slots (tcp / x11 / agent) and the server
+# admission plane are separate protocol exits.  A ChannelOpenProfile tightens
+# each of them independently.  Profiles are pushed onto a per-Transport stack
+# (never a process global), merged with the baseline profile when read, and
+# popped to restore the outer profile; the context-manager form guarantees
+# the frame is removed even when a nested call raises.  With an empty stack
+# every exit behaves exactly as the stock protocol implementation.
+
+class _ProfileSection (object):
+    """A single group of related profile pins (``None`` means unset)."""
+    __fields__ = ()
+
+    def __init__(self, **kwargs):
+        for name in self.__fields__:
+            setattr(self, name, kwargs.get(name))
+
+    def merged_over(self, lower):
+        """Overlay this section on ``lower``; only explicit pins win."""
+        merged = type(self)()
+        for name in self.__fields__:
+            value = getattr(self, name)
+            setattr(merged, name,
+                    value if value is not None else getattr(lower, name))
+        return merged
+
+    def _as_tuple(self):
+        return tuple(getattr(self, name) for name in self.__fields__)
+
+    def __eq__(self, other):
+        return type(self) is type(other) and \
+            self._as_tuple() == other._as_tuple()
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __repr__(self):
+        body = ', '.join('%s=%r' % (name, getattr(self, name))
+                         for name in self.__fields__
+                         if getattr(self, name) is not None)
+        return '%s(%s)' % (type(self).__name__, body)
+
+
+class ForwardControlSection (_ProfileSection):
+    """Pins for the reverse port-forward control plane."""
+    __fields__ = ('request_wait', 'allocate_ephemeral',
+                  'cancel_clears_handler', 'forbid_forward')
+
+
+class InboundDeliverySection (_ProfileSection):
+    """Pins for where inbound ``forwarded-tcpip`` channels land."""
+    __fields__ = ('accept_queue', 'custom_tcp_handler', 'reject_tcp_inbound')
+
+
+class HandlerSlotsSection (_ProfileSection):
+    """Pins keeping the tcp / x11 / agent inbound handler slots separate."""
+    __fields__ = ('tcp_isolated', 'x11_via_channel_req',
+                  'agent_via_channel_req')
+
+
+class ChannelOpenKindSection (_ProfileSection):
+    """Pins for the CHANNEL_OPEN address tail carried by each kind."""
+    __fields__ = ('session_plain', 'direct_tcpip_addrs',
+                  'forwarded_tcpip_addrs', 'x11_src_only')
+
+
+class ServerAdmitSection (_ProfileSection):
+    """Pins for server-mode channel admission and queueing."""
+    __fields__ = ('direct_check', 'generic_check', 'queue_non_forward')
+
+
+class ChannelOpenProfile (object):
+    """
+    One frame of the Transport-level port-forward / channel-open policy.
+
+    Every pin defaults to ``None`` ("leave the outer profile untouched").
+    Frames overlay the outer profile (and ultimately the baseline profile)
+    when the effective view is read.  The pins are grouped by protocol exit:
+
+    * **forward_control** -- ``request_wait`` (the ``tcpip-forward``
+      ``GLOBAL_REQUEST`` must be sent with ``want-reply`` and its reply
+      consumed), ``allocate_ephemeral`` (``port=0`` must consume the
+      server-allocated port from the success reply),
+      ``cancel_clears_handler`` (cancel must clear the tcp handler slot
+      before sending ``cancel-tcpip-forward``) and ``forbid_forward``
+      (refuse ``request_port_forward`` outright).
+    * **inbound_delivery** -- ``accept_queue`` (inbound
+      ``forwarded-tcpip`` may only enter the `Transport.accept` queue),
+      ``custom_tcp_handler`` (inbound ``forwarded-tcpip`` must be delivered
+      to the registered tcp callback and must never be impersonated by the
+      accept queue) and ``reject_tcp_inbound`` (refuse inbound
+      ``forwarded-tcpip`` with ``CHANNEL_OPEN_FAILURE``).
+    * **handler_slots** -- ``tcp_isolated`` (the tcp slot must never be
+      borrowed by the x11/agent slots, or vice versa),
+      ``x11_via_channel_req`` / ``agent_via_channel_req`` (the x11 and agent
+      slots may only be armed through `Channel.request_x11` /
+      `Channel.request_forward_agent`, i.e. the ``CHANNEL_REQUEST`` path,
+      never by poking the slot directly).
+    * **channel_open_kind** -- ``session_plain`` (``session`` and
+      ``auth-agent@openssh.com`` carry no address tail),
+      ``direct_tcpip_addrs`` / ``forwarded_tcpip_addrs`` (both destination
+      and source pairs are required) and ``x11_src_only`` (``x11`` carries
+      only the source pair).  A plain kind must never impersonate an
+      addressed kind.
+    * **server_admit** -- ``direct_check`` (server-mode ``direct-tcpip``
+      must be admitted through
+      `ServerInterface.check_channel_direct_tcpip_request`),
+      ``generic_check`` (every other kind goes through
+      `ServerInterface.check_channel_request`) and ``queue_non_forward``
+      (a successfully admitted, non-forwarded channel must be queued for
+      `Transport.accept`).
+    """
+
+    _SECTIONS = (
+        ('forward_control', ForwardControlSection,
+         ('request_wait', 'allocate_ephemeral', 'cancel_clears_handler',
+          'forbid_forward')),
+        ('inbound_delivery', InboundDeliverySection,
+         ('accept_queue', 'custom_tcp_handler', 'reject_tcp_inbound')),
+        ('handler_slots', HandlerSlotsSection,
+         ('tcp_isolated', 'x11_via_channel_req', 'agent_via_channel_req')),
+        ('channel_open_kind', ChannelOpenKindSection,
+         ('session_plain', 'direct_tcpip_addrs', 'forwarded_tcpip_addrs',
+          'x11_src_only')),
+        ('server_admit', ServerAdmitSection,
+         ('direct_check', 'generic_check', 'queue_non_forward')),
+    )
+
+    def __init__(self,
+                 request_wait=None, allocate_ephemeral=None,
+                 cancel_clears_handler=None, forbid_forward=None,
+                 accept_queue=None, custom_tcp_handler=None,
+                 reject_tcp_inbound=None,
+                 tcp_isolated=None, x11_via_channel_req=None,
+                 agent_via_channel_req=None,
+                 session_plain=None, direct_tcpip_addrs=None,
+                 forwarded_tcpip_addrs=None, x11_src_only=None,
+                 direct_check=None, generic_check=None,
+                 queue_non_forward=None):
+        local = dict(locals())
+        for section_name, section_cls, field_names in self._SECTIONS:
+            setattr(self, section_name,
+                    section_cls(**dict((name, local[name])
+                                       for name in field_names)))
+        # set by push_channel_open_profile(); owning stack for __exit__
+        self._stack = None
+
+    def merged_over(self, lower):
+        merged = ChannelOpenProfile.__new__(ChannelOpenProfile)
+        merged._stack = None
+        for section_name, _, _ in self._SECTIONS:
+            setattr(merged, section_name,
+                    getattr(self, section_name).merged_over(
+                        getattr(lower, section_name)))
+        return merged
+
+    def __enter__(self):
+        if self._stack is None:
+            raise SSHException('ChannelOpenProfile must be pushed onto a '
+                               'Transport before being used as a context')
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        stack = self._stack
+        if stack is not None:
+            stack.pop(self)
+        # never swallow exceptions raised inside the with-block
+        return False
+
+
+def _baseline_channel_open_profile():
+    # Baseline reproduces the stock protocol behavior: synchronous
+    # tcpip-forward replies are consumed, the cancel clears the tcp slot,
+    # CHANNEL_OPEN address tails follow the kind table and server mode uses
+    # the dedicated direct-tcpip check; inbound delivery and slot isolation
+    # pins are off until a frame tightens them.
+    return ChannelOpenProfile(
+        request_wait=True, allocate_ephemeral=True,
+        cancel_clears_handler=True, forbid_forward=False,
+        accept_queue=False, custom_tcp_handler=False,
+        reject_tcp_inbound=False,
+        tcp_isolated=False, x11_via_channel_req=False,
+        agent_via_channel_req=False,
+        session_plain=True, direct_tcpip_addrs=True,
+        forwarded_tcpip_addrs=True, x11_src_only=True,
+        direct_check=True, generic_check=True, queue_non_forward=True)
+
+
+class ChannelOpenProfileStack (object):
+    """
+    Per-Transport stack of `ChannelOpenProfile` frames.
+
+    The stack is owned by exactly one `Transport`; frames never live in a
+    process-global object, and two Transports can never share a stack.
+    """
+
+    def __init__(self, transport):
+        self._transport_ref = weakref.ref(transport)
+        self._frames = []
+        self._baseline = _baseline_channel_open_profile()
+        self.lock = threading.RLock()
+
+    def __len__(self):
+        return len(self._frames)
+
+    @property
+    def transport(self):
+        return self._transport_ref()
+
+    def push(self, profile):
+        if not isinstance(profile, ChannelOpenProfile):
+            raise TypeError('expected a ChannelOpenProfile')
+        with self.lock:
+            if profile._stack is not None:
+                raise SSHException('ChannelOpenProfile is already pushed')
+            profile._stack = self
+            self._frames.append(profile)
+        return profile
+
+    def pop(self, profile=None):
+        with self.lock:
+            if not self._frames:
+                raise IndexError('channel-open profile stack is empty; '
+                                 'cannot pop below the transport baseline')
+            if profile is None:
+                popped = self._frames.pop()
+            else:
+                if profile._stack is not self:
+                    raise SSHException('ChannelOpenProfile belongs to a '
+                                       'different Transport')
+                if self._frames[-1] is not profile:
+                    raise SSHException('only the top channel-open profile '
+                                       'may be popped')
+                self._frames.pop()
+                popped = profile
+            popped._stack = None
+            return popped
+
+    def reset(self):
+        """Forget every frame; used when the Transport session ends."""
+        with self.lock:
+            for frame in self._frames:
+                frame._stack = None
+            self._frames = []
+
+    def _effective(self, section_name):
+        with self.lock:
+            section = getattr(self._baseline, section_name)
+            for frame in self._frames:
+                section = getattr(frame, section_name).merged_over(section)
+            return section
+
+    # Five purpose-built views, one per protocol exit -- this is deliberately
+    # not a single "give me everything" accessor, because each exit consumes
+    # only its own section.
+    def effective_forward_control(self):
+        return self._effective('forward_control')
+
+    def effective_inbound_delivery(self):
+        return self._effective('inbound_delivery')
+
+    def effective_handler_slots(self):
+        return self._effective('handler_slots')
+
+    def effective_channel_open_kind(self):
+        return self._effective('channel_open_kind')
+
+    def effective_server_admit(self):
+        return self._effective('server_admit')
 
 
 class Transport (threading.Thread, ClosingContextManager):
@@ -369,6 +646,17 @@ class Transport (threading.Thread, ClosingContextManager):
         self._forward_agent_handler = None
         self._x11_handler = None
         self._tcp_handler = None
+        # provenance of the three inbound handler slots:
+        # slot -> (source, flavor), where source is one of
+        # 'global:tcpip-forward', 'channel:x11-req',
+        # 'channel:auth-agent-req' (or None when the slot was poked directly)
+        # and flavor is 'custom' or 'default'.
+        self._inbound_handler_provenance = {
+            'tcp': None, 'x11': None, 'agent': None}
+
+        # per-session port-forward / channel-open profile stack; never shared
+        # with another Transport and never a process-global object
+        self._open_profile_stack = ChannelOpenProfileStack(self)
 
         self.saved_exception = None
         self.clear_to_send = threading.Event()
@@ -798,20 +1086,9 @@ class Transport (threading.Thread, ClosingContextManager):
             window_size = self._sanitize_window_size(window_size)
             max_packet_size = self._sanitize_packet_size(max_packet_size)
             chanid = self._next_channel()
-            m = Message()
-            m.add_byte(cMSG_CHANNEL_OPEN)
-            m.add_string(kind)
-            m.add_int(chanid)
-            m.add_int(window_size)
-            m.add_int(max_packet_size)
-            if (kind == 'forwarded-tcpip') or (kind == 'direct-tcpip'):
-                m.add_string(dest_addr[0])
-                m.add_int(dest_addr[1])
-                m.add_string(src_addr[0])
-                m.add_int(src_addr[1])
-            elif kind == 'x11':
-                m.add_string(src_addr[0])
-                m.add_int(src_addr[1])
+            m = self._build_channel_open_message(
+                kind, chanid, window_size, max_packet_size,
+                dest_addr, src_addr)
             chan = Channel(chanid)
             self._channels.put(chanid, chan)
             self.channel_events[chanid] = event = threading.Event()
@@ -871,19 +1148,28 @@ class Transport (threading.Thread, ClosingContextManager):
         """
         if not self.active:
             raise SSHException('SSH session not active')
+        control = self._open_profile_stack.effective_forward_control()
+        if control.forbid_forward:
+            raise SSHException('request_port_forward is forbidden by the '
+                               'active channel-open profile')
         port = int(port)
-        response = self.global_request('tcpip-forward', (address, port), wait=True)
+        # The forward-control section pins the reverse-forward control plane
+        # to a synchronous GLOBAL_REQUEST: wait=True consumes the reply (and
+        # therefore the completion event), which is exactly what lets a
+        # port=0 reply carry the allocated port.  set_keepalive stays a
+        # separate, fire-and-forget global_request(wait=False).
+        response = self.global_request('tcpip-forward', (address, port),
+                                       wait=bool(control.request_wait))
         if response is None:
             raise SSHException('TCP forwarding request denied')
         if port == 0:
-            port = response.get_int()
-        if handler is None:
-            def default_handler(channel, src_addr, dest_addr_port):
-                #src_addr, src_port = src_addr_port
-                #dest_addr, dest_port = dest_addr_port
-                self._queue_incoming_channel(channel)
-            handler = default_handler
-        self._tcp_handler = handler
+            if control.allocate_ephemeral:
+                port = self._read_allocated_port(response)
+            else:
+                port = response.get_int()
+        # the tcp handler slot is armed only through the GLOBAL_REQUEST path;
+        # _register_tcp_handler records that provenance for inbound dispatch
+        self._register_tcp_handler(handler)
         return port
 
     def cancel_port_forward(self, address, port):
@@ -897,8 +1183,135 @@ class Transport (threading.Thread, ClosingContextManager):
         """
         if not self.active:
             return
-        self._tcp_handler = None
+        control = self._open_profile_stack.effective_forward_control()
+        if control.cancel_clears_handler:
+            # tear down the tcp slot first, so an inbound forwarded-tcpip
+            # arriving during teardown can no longer reach the stale handler
+            self._clear_tcp_handler()
         self.global_request('cancel-tcpip-forward', (address, port), wait=True)
+
+    def push_channel_open_profile(self, profile=None, **pins):
+        """
+        Push a `ChannelOpenProfile` frame onto this Transport's profile
+        stack.  The returned frame can be popped explicitly with
+        `pop_channel_open_profile`, or used as a context manager that always
+        pops on exit (including exceptional exits).
+
+        :param .ChannelOpenProfile profile:
+            an existing frame, or ``None`` to build one from keyword pins
+        :param pins:
+            any `ChannelOpenProfile` pin (e.g. ``accept_queue=True``)
+        :return: the pushed `.ChannelOpenProfile`
+        """
+        if profile is None:
+            profile = ChannelOpenProfile(**pins)
+        elif pins:
+            raise ValueError('cannot pass both a profile and profile pins')
+        return self._open_profile_stack.push(profile)
+
+    def pop_channel_open_profile(self, profile=None):
+        """
+        Pop a `ChannelOpenProfile` frame, restoring the outer profile.  It is
+        an error to pop below the Transport's baseline.
+
+        :param .ChannelOpenProfile profile:
+            the frame to pop (must be the top frame); ``None`` pops the top
+        :return: the popped `.ChannelOpenProfile`
+        """
+        return self._open_profile_stack.pop(profile)
+
+    @contextlib.contextmanager
+    def channel_open_profile(self, **pins):
+        """
+        Context manager form of `push_channel_open_profile`::
+
+            with transport.channel_open_profile(accept_queue=True):
+                ...  # inbound forwarded-tcpip is forced into accept()
+
+        The frame is popped on block exit even if the block raises, so nested
+        middleware scopes recover the outer user profile.
+        """
+        profile = self.push_channel_open_profile(**pins)
+        try:
+            yield profile
+        finally:
+            try:
+                self.pop_channel_open_profile(profile)
+            except (IndexError, SSHException):
+                # already popped by an outer/inner unwind path
+                pass
+
+    def _read_allocated_port(self, response):
+        """Consume the server-allocated port from a tcpip-forward reply."""
+        return response.get_int()
+
+    def _build_channel_open_message(self, kind, chanid, window_size,
+                                    max_packet_size, dest_addr, src_addr):
+        """
+        Build the outbound CHANNEL_OPEN message, appending the address tail
+        mandated by the effective channel_open_kind section.
+        """
+        section = self._open_profile_stack.effective_channel_open_kind()
+        m = Message()
+        m.add_byte(cMSG_CHANNEL_OPEN)
+        m.add_string(kind)
+        m.add_int(chanid)
+        m.add_int(window_size)
+        m.add_int(max_packet_size)
+        self._append_channel_open_addresses(m, kind, dest_addr, src_addr,
+                                            section)
+        return m
+
+    def _append_channel_open_addresses(self, m, kind, dest_addr, src_addr,
+                                       section):
+        """
+        Append the per-kind address tail, returning its shape: ``'plain'``
+        (no tail), ``'dest-src'`` (destination + source pairs) or
+        ``'src-only'`` (x11).
+        """
+        if kind == 'direct-tcpip':
+            if not section.direct_tcpip_addrs:
+                raise SSHException('direct-tcpip must carry destination and '
+                                   'source address pairs under the active '
+                                   'profile')
+            if (dest_addr is None) or (src_addr is None):
+                raise SSHException('direct-tcpip channel requires '
+                                   'dest_addr and src_addr')
+            m.add_string(dest_addr[0])
+            m.add_int(dest_addr[1])
+            m.add_string(src_addr[0])
+            m.add_int(src_addr[1])
+            return 'dest-src'
+        if kind == 'forwarded-tcpip':
+            if not section.forwarded_tcpip_addrs:
+                raise SSHException('forwarded-tcpip must carry destination '
+                                   'and source address pairs under the '
+                                   'active profile')
+            if (dest_addr is None) or (src_addr is None):
+                raise SSHException('forwarded-tcpip channel requires '
+                                   'dest_addr and src_addr')
+            m.add_string(dest_addr[0])
+            m.add_int(dest_addr[1])
+            m.add_string(src_addr[0])
+            m.add_int(src_addr[1])
+            return 'dest-src'
+        if kind == 'x11':
+            # x11 carries ONLY the originator pair; a destination tail would
+            # impersonate a tcpip kind
+            if not section.x11_src_only:
+                raise SSHException('x11 must carry only its source address '
+                                   'pair under the active profile')
+            if src_addr is None:
+                raise SSHException('x11 channel requires src_addr')
+            m.add_string(src_addr[0])
+            m.add_int(src_addr[1])
+            return 'src-only'
+        # session and auth-agent@openssh.com never carry an address tail,
+        # even if the caller happened to pass address tuples
+        if not section.session_plain:
+            raise SSHException('plain channel kinds must not carry an '
+                               'address tail under the active profile')
+        return 'plain'
 
     def open_sftp_client(self):
         """
@@ -1537,6 +1950,9 @@ class Transport (threading.Thread, ClosingContextManager):
 
     def stop_thread(self):
         self.active = False
+        # the profile stack is bound to this Transport's session cycle:
+        # drop every pushed frame when the session tears down
+        self._open_profile_stack.reset()
         self.packetizer.close()
         if PY2:
             # Original join logic; #520 doesn't appear commonly present under
@@ -1671,23 +2087,190 @@ class Transport (threading.Thread, ClosingContextManager):
         else:
             return self._cipher_info[name]['class'].new(key, self._cipher_info[name]['mode'], iv)
 
-    def _set_forward_agent_handler(self, handler):
+    # --- inbound handler slots -------------------------------------------
+    # The three slots are armed by distinct protocol exits:
+    #   'tcp'   <- request_port_forward        (GLOBAL_REQUEST tcpip-forward)
+    #   'x11'   <- Channel.request_x11         (CHANNEL_REQUEST x11-req)
+    #   'agent' <- Channel.request_forward_agent
+    #                                       (CHANNEL_REQUEST auth-agent-req)
+
+    _INBOUND_SLOT_ATTR = {
+        'tcp': '_tcp_handler',
+        'x11': '_x11_handler',
+        'agent': '_forward_agent_handler',
+    }
+    _INBOUND_SLOT_SOURCE = {
+        'tcp': 'global:tcpip-forward',
+        'x11': 'channel:x11-req',
+        'agent': 'channel:auth-agent-req',
+    }
+    _INBOUND_SOURCE_SLOT = {
+        'global:tcpip-forward': 'tcp',
+        'channel:x11-req': 'x11',
+        'channel:auth-agent-req': 'agent',
+    }
+
+    def _set_forward_agent_handler(self, handler, via_channel_request=False):
+        """
+        Arm the agent inbound slot.  ``via_channel_request`` must be True only
+        when called from `Channel.request_forward_agent` (after the
+        ``auth-agent-req@openssh.com`` CHANNEL_REQUEST was sent).
+        """
+        slots = self._open_profile_stack.effective_handler_slots()
+        if (not via_channel_request) and slots.agent_via_channel_req:
+            raise SSHException('the agent handler slot may only be armed '
+                               'through Channel.request_forward_agent under '
+                               'the active channel-open profile')
         if handler is None:
             def default_handler(channel):
                 self._queue_incoming_channel(channel)
-            self._forward_agent_handler = default_handler
+            handler = default_handler
+            flavor = 'default'
         else:
-            self._forward_agent_handler = handler
+            flavor = 'custom'
+        self._arm_inbound_slot(
+            'agent', handler,
+            'channel:auth-agent-req' if via_channel_request else None,
+            flavor)
 
-    def _set_x11_handler(self, handler):
+    def _set_x11_handler(self, handler, via_channel_request=False):
+        """
+        Arm the x11 inbound slot.  ``via_channel_request`` must be True only
+        when called from `Channel.request_x11` (after the ``x11-req``
+        CHANNEL_REQUEST was sent).
+        """
         # only called if a channel has turned on x11 forwarding
+        slots = self._open_profile_stack.effective_handler_slots()
+        if (not via_channel_request) and slots.x11_via_channel_req:
+            raise SSHException('the x11 handler slot may only be armed '
+                               'through Channel.request_x11 under the active '
+                               'channel-open profile')
         if handler is None:
             # by default, use the same mechanism as accept()
             def default_handler(channel, src_addr_port):
                 self._queue_incoming_channel(channel)
-            self._x11_handler = default_handler
+            handler = default_handler
+            flavor = 'default'
         else:
-            self._x11_handler = handler
+            flavor = 'custom'
+        self._arm_inbound_slot(
+            'x11', handler,
+            'channel:x11-req' if via_channel_request else None,
+            flavor)
+
+    def _register_tcp_handler(self, handler):
+        """Arm the tcp inbound slot through the GLOBAL_REQUEST path."""
+        if handler is None:
+            def default_handler(channel, src_addr, dest_addr_port):
+                self._queue_incoming_channel(channel)
+            handler = default_handler
+            flavor = 'default'
+        else:
+            flavor = 'custom'
+        self._arm_inbound_slot('tcp', handler,
+                               'global:tcpip-forward', flavor)
+
+    def _clear_tcp_handler(self):
+        """Disarm the tcp slot (used by cancel-tcpip-forward teardown)."""
+        self._tcp_handler = None
+        self._inbound_handler_provenance['tcp'] = None
+
+    def _arm_inbound_slot(self, slot, handler, source, flavor):
+        # A handler may only ever be written into the slot its registration
+        # path owns -- arming e.g. the tcp slot through the x11 path would mix
+        # the three inbound deliveries and is always refused.
+        if source is not None:
+            source_slot = self._INBOUND_SOURCE_SLOT.get(source)
+            if source_slot != slot:
+                raise SSHException('cannot arm the %r inbound slot through '
+                                   'the %r registration path' % (slot, source))
+        setattr(self, self._INBOUND_SLOT_ATTR[slot], handler)
+        self._inbound_handler_provenance[slot] = (
+            (source, flavor) if source is not None else None)
+
+    def _resolve_inbound_slot(self, slot, slots_section):
+        """
+        Return ``(handler, flavor)`` for an inbound kind if its slot is armed
+        through the path required by the effective handler_slots section, or
+        ``(None, None)`` if delivery must not borrow this slot.
+        """
+        handler = getattr(self, self._INBOUND_SLOT_ATTR[slot])
+        if handler is None:
+            return None, None
+        provenance = self._inbound_handler_provenance.get(slot)
+        required_source = self._INBOUND_SLOT_SOURCE[slot]
+        if slots_section.tcp_isolated and (
+                provenance is None or provenance[0] != required_source):
+            # something armed the attribute directly or through a foreign
+            # path; isolated slots refuse to borrow it
+            return None, None
+        if slot == 'x11' and slots_section.x11_via_channel_req and (
+                provenance is None or provenance[0] != required_source):
+            return None, None
+        if slot == 'agent' and slots_section.agent_via_channel_req and (
+                provenance is None or provenance[0] != required_source):
+            return None, None
+        flavor = provenance[1] if provenance is not None else 'custom'
+        return handler, flavor
+
+    def _plan_inbound_forward(self, kind, delivery, slots_section):
+        """
+        Decide inbound delivery for a forwarded channel kind.
+
+        :return:
+            ``None`` if this kind is not armed locally (server-mode generic
+            admission / client-mode rejection is decided by the caller), or a
+            ``(slot, handler, decision)`` plan where decision is
+            ``'handler'`` or ``'queue'``; a forced refusal is returned as
+            ``('reject', reason, None)``.
+        """
+        if kind == 'auth-agent@openssh.com':
+            handler, _ = self._resolve_inbound_slot('agent', slots_section)
+            if handler is None:
+                return None
+            return ('agent', handler, 'handler')
+        if kind == 'x11':
+            handler, _ = self._resolve_inbound_slot('x11', slots_section)
+            if handler is None:
+                return None
+            return ('x11', handler, 'handler')
+        if kind == 'forwarded-tcpip':
+            handler, flavor = self._resolve_inbound_slot(
+                'tcp', slots_section)
+            if handler is None:
+                return None
+            if delivery.reject_tcp_inbound:
+                return ('reject',
+                        OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED, None)
+            if delivery.accept_queue:
+                # only the accept() queue may receive the channel, even if a
+                # user callback is registered
+                return ('tcp', handler, 'queue')
+            if delivery.custom_tcp_handler:
+                # a queueing default handler must not impersonate a callback
+                if flavor != 'custom':
+                    return ('reject',
+                            OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED, None)
+                return ('tcp', handler, 'handler')
+            return ('tcp', handler, 'handler')
+        return None
+
+    def _server_admit_channel(self, admit, kind, my_chanid, origin,
+                              destination):
+        """
+        Server-mode admission, routed through the ServerInterface bearing
+        surface: ``direct-tcpip`` goes to the dedicated direct-tcpip check,
+        every other kind goes to the generic check.
+        """
+        server = self.server_object
+        if kind == 'direct-tcpip':
+            if not admit.direct_check:
+                return OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+            return server.check_channel_open_request(
+                kind, my_chanid, origin, destination)
+        if not admit.generic_check:
+            return OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+        return server.check_channel_open_request(kind, my_chanid)
 
     def _queue_incoming_channel(self, channel):
         self.lock.acquire()
@@ -2244,29 +2827,42 @@ class Transport (threading.Thread, ClosingContextManager):
         chanid = m.get_int()
         initial_window_size = m.get_int()
         max_packet_size = m.get_int()
+
+        delivery = self._open_profile_stack.effective_inbound_delivery()
+        slots_section = self._open_profile_stack.effective_handler_slots()
+        admit = self._open_profile_stack.effective_server_admit()
+
         reject = False
-        if (kind == 'auth-agent@openssh.com') and (self._forward_agent_handler is not None):
-            self._log(DEBUG, 'Incoming forward agent connection')
-            self.lock.acquire()
-            try:
-                my_chanid = self._next_channel()
-            finally:
-                self.lock.release()
-        elif (kind == 'x11') and (self._x11_handler is not None):
-            origin_addr = m.get_text()
-            origin_port = m.get_int()
-            self._log(DEBUG, 'Incoming x11 connection from %s:%d' % (origin_addr, origin_port))
-            self.lock.acquire()
-            try:
-                my_chanid = self._next_channel()
-            finally:
-                self.lock.release()
-        elif (kind == 'forwarded-tcpip') and (self._tcp_handler is not None):
-            server_addr = m.get_text()
-            server_port = m.get_int()
-            origin_addr = m.get_text()
-            origin_port = m.get_int()
-            self._log(DEBUG, 'Incoming tcp forwarded connection from %s:%d' % (origin_addr, origin_port))
+        reason = OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+        my_chanid = None
+        forward_plan = None      # (slot, handler, 'handler' | 'queue')
+        server_admitted = False
+        origin_addr = origin_port = None
+        server_addr = server_port = None
+
+        # inbound forwarded channels are dispatched through the slot their
+        # registration path armed; the inbound_delivery section decides where
+        # a forwarded-tcpip channel finally lands
+        plan = self._plan_inbound_forward(kind, delivery, slots_section)
+        if (plan is not None) and (plan[0] == 'reject'):
+            self._log(DEBUG, 'Refusing "%s" inbound channel per the active '
+                             'channel-open profile.' % kind)
+            reject = True
+            reason = plan[1]
+        elif plan is not None:
+            if kind == 'x11':
+                origin_addr = m.get_text()
+                origin_port = m.get_int()
+                self._log(DEBUG, 'Incoming x11 connection from %s:%d' % (origin_addr, origin_port))
+            elif kind == 'forwarded-tcpip':
+                server_addr = m.get_text()
+                server_port = m.get_int()
+                origin_addr = m.get_text()
+                origin_port = m.get_int()
+                self._log(DEBUG, 'Incoming tcp forwarded connection from %s:%d' % (origin_addr, origin_port))
+            else:
+                self._log(DEBUG, 'Incoming forward agent connection')
+            forward_plan = plan
             self.lock.acquire()
             try:
                 my_chanid = self._next_channel()
@@ -2275,7 +2871,6 @@ class Transport (threading.Thread, ClosingContextManager):
         elif not self.server_mode:
             self._log(DEBUG, 'Rejecting "%s" channel request from server.' % kind)
             reject = True
-            reason = OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
         else:
             self.lock.acquire()
             try:
@@ -2288,13 +2883,17 @@ class Transport (threading.Thread, ClosingContextManager):
                 dest_port = m.get_int()
                 origin_addr = m.get_text()
                 origin_port = m.get_int()
-                reason = self.server_object.check_channel_direct_tcpip_request(
-                    my_chanid, (origin_addr, origin_port), (dest_addr, dest_port))
+                reason = self._server_admit_channel(
+                    admit, kind, my_chanid,
+                    (origin_addr, origin_port), (dest_addr, dest_port))
             else:
-                reason = self.server_object.check_channel_request(kind, my_chanid)
+                reason = self._server_admit_channel(
+                    admit, kind, my_chanid, None, None)
             if reason != OPEN_SUCCEEDED:
                 self._log(DEBUG, 'Rejecting "%s" channel request from client.' % kind)
                 reject = True
+            else:
+                server_admitted = True
         if reject:
             msg = Message()
             msg.add_byte(cMSG_CHANNEL_OPEN_FAILURE)
@@ -2323,14 +2922,22 @@ class Transport (threading.Thread, ClosingContextManager):
         m.add_int(self.default_max_packet_size)
         self._send_message(m)
         self._log(DEBUG, 'Secsh channel %d (%s) opened.', my_chanid, kind)
-        if kind == 'auth-agent@openssh.com':
-            self._forward_agent_handler(chan)
-        elif kind == 'x11':
-            self._x11_handler(chan, (origin_addr, origin_port))
-        elif kind == 'forwarded-tcpip':
-            chan.origin_addr = (origin_addr, origin_port)
-            self._tcp_handler(chan, (origin_addr, origin_port), (server_addr, server_port))
-        else:
+        if forward_plan is not None:
+            _, handler, decision = forward_plan
+            if kind == 'auth-agent@openssh.com':
+                handler(chan)
+            elif kind == 'x11':
+                handler(chan, (origin_addr, origin_port))
+            else:
+                # forwarded-tcpip: the active profile pins the delivery to
+                # the registered callback or to the accept queue
+                if decision == 'queue':
+                    self._queue_incoming_channel(chan)
+                else:
+                    chan.origin_addr = (origin_addr, origin_port)
+                    handler(chan, (origin_addr, origin_port),
+                            (server_addr, server_port))
+        elif server_admitted and admit.queue_non_forward:
             self._queue_incoming_channel(chan)
 
     def _parse_debug(self, m):

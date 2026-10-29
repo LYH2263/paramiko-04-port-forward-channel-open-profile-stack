@@ -504,6 +504,40 @@ class ServerInterface (object):
         """
         return False
 
+    def check_channel_open_request(self, kind, chanid, origin=None,
+                                   destination=None):
+        """
+        Admission entry point for an inbound ``CHANNEL_OPEN`` request in
+        server mode.  This is the single bearing surface the Transport calls
+        when admitting a channel opened by the client; it routes the request
+        to the check that owns the kind instead of letting a generic check
+        impersonate the dedicated ``direct-tcpip`` path (or vice versa):
+
+        * ``"direct-tcpip"`` is always admitted through
+          `check_channel_direct_tcpip_request` (with the ``origin`` and
+          ``destination`` pairs);
+        * every other kind is admitted through `check_channel_request`.
+
+        The leaf check actually used is recorded on the server object as
+        ``last_channel_open_route`` (``"direct-tcpip"`` or the requested
+        kind), so callers can observe on the ServerInterface side which
+        admission path ran.
+
+        :param str kind: channel kind requested by the client
+        :param int chanid: ID of the prospective channel
+        :param tuple origin:
+            ``(ip_address, port)`` of the originator (direct-tcpip only)
+        :param tuple destination:
+            ``(ip_address, port)`` of the destination (direct-tcpip only)
+        :return: ``OPEN_SUCCEEDED`` or an ``OPEN_FAILED_*`` code
+        """
+        if kind == 'direct-tcpip':
+            self.last_channel_open_route = 'direct-tcpip'
+            return self.check_channel_direct_tcpip_request(
+                chanid, origin, destination)
+        self.last_channel_open_route = kind
+        return self.check_channel_request(kind, chanid)
+
     def check_channel_direct_tcpip_request(self, chanid, origin, destination):
         """
         Determine if a local port forwarding channel will be granted, and

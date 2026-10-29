@@ -27,7 +27,7 @@ __author__ = "Jeff Forcier <jeff@bitprophet.org>"
 __license__ = "GNU Lesser General Public License (LGPL)"
 
 
-from paramiko.transport import SecurityOptions, Transport
+from paramiko.transport import SecurityOptions, Transport, ChannelOpenProfile
 from paramiko.client import SSHClient, MissingHostKeyPolicy, AutoAddPolicy, RejectPolicy, WarningPolicy
 from paramiko.auth_handler import AuthHandler
 from paramiko.ssh_gss import GSSAuth, GSS_AUTH_AVAILABLE
@@ -71,6 +71,7 @@ __all__ = [ 'Transport',
             'RejectPolicy',
             'WarningPolicy',
             'SecurityOptions',
+            'ChannelOpenProfile',
             'SubsystemHandler',
             'Channel',
             'PKey',
